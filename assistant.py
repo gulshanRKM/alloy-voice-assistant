@@ -1,9 +1,10 @@
 import base64
 from threading import Lock, Thread
-
+import time
+import numpy
 import cv2
 import openai
-from cv2 import VideoCapture, imencode
+from cv2 import imencode
 from dotenv import load_dotenv
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema.messages import SystemMessage
@@ -16,11 +17,9 @@ from speech_recognition import Microphone, Recognizer, UnknownValueError
 
 load_dotenv()
 
-
-class WebcamStream:
+class DesktopScreenshot:
     def __init__(self):
-        self.stream = VideoCapture(index=0)
-        _, self.frame = self.stream.read()
+        self.screenshot = None
         self.running = False
         self.lock = Lock()
 
@@ -29,38 +28,38 @@ class WebcamStream:
             return self
 
         self.running = True
-
-        self.thread = Thread(target=self.update, args=())
+        self.thread = Thread(target=self.update, daemon=True)
         self.thread.start()
         return self
 
     def update(self):
-        while self.running:
-            _, frame = self.stream.read()
+        from mss import mss
+        with mss() as sct:
+            while self.running:
+                monitor = sct.monitors[1]  # Primary monitor
+                sct_img = sct.grab(monitor)
+                img = numpy.array(sct_img)
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-            self.lock.acquire()
-            self.frame = frame
-            self.lock.release()
+                with self.lock:
+                    self.screenshot = img
+
+                time.sleep(0.1)
 
     def read(self, encode=False):
-        self.lock.acquire()
-        frame = self.frame.copy()
-        self.lock.release()
+        with self.lock:
+            screenshot = self.screenshot.copy() if self.screenshot is not None else None
 
-        if encode:
-            _, buffer = imencode(".jpeg", frame)
+        if encode and screenshot is not None:
+            _, buffer = imencode(".jpeg", screenshot)
             return base64.b64encode(buffer)
 
-        return frame
+        return screenshot
 
     def stop(self):
         self.running = False
         if self.thread.is_alive():
             self.thread.join()
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        self.stream.release()
-
 
 class Assistant:
     def __init__(self, model):
@@ -87,23 +86,24 @@ class Assistant:
 
         with openai.audio.speech.with_streaming_response.create(
             model="tts-1",
-            voice="alloy",
+            voice="shimmer",
             response_format="pcm",
             input=response,
         ) as stream:
             for chunk in stream.iter_bytes(chunk_size=1024):
                 player.write(chunk)
 
+        player.close()
+
     def _create_inference_chain(self, model):
         SYSTEM_PROMPT = """
         You are a witty assistant that will use the chat history and the image 
-        provided by the user to answer its questions. Your job is to answer 
-        questions.
+        provided by the user to answer its questions.
 
         Use few words on your answers. Go straight to the point. Do not use any
-        emoticons or emojis. 
+        emoticons or emojis. Do not ask the user any questions.
 
-        Be friendly and helpful. Show some personality.
+        Be friendly and helpful. Show some personality. Do not be too formal.
         """
 
         prompt_template = ChatPromptTemplate.from_messages(
@@ -114,10 +114,7 @@ class Assistant:
                     "human",
                     [
                         {"type": "text", "text": "{prompt}"},
-                        {
-                            "type": "image_url",
-                            "image_url": "data:image/jpeg;base64,{image_base64}",
-                        },
+                        {"type": "image_url", "image_url": "data:image/jpeg;base64,{image_base64}"},
                     ],
                 ),
             ]
@@ -133,39 +130,42 @@ class Assistant:
             history_messages_key="chat_history",
         )
 
+# Initialize screenshot capturing
+desktop_screenshot = DesktopScreenshot().start()
 
-webcam_stream = WebcamStream().start()
-
-# model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest")
-
-# You can use OpenAI's GPT-4o model instead of Gemini Flash
-# by uncommenting the following line:
+# Initialize model
 model = ChatOpenAI(model="gpt-4o")
-
 assistant = Assistant(model)
 
-
-def audio_callback(recognizer, audio):
-    try:
-        prompt = recognizer.recognize_whisper(audio, model="base", language="english")
-        assistant.answer(prompt, webcam_stream.read(encode=True))
-
-    except UnknownValueError:
-        print("There was an error processing the audio.")
-
-
+# Initialize speech recognizer
 recognizer = Recognizer()
 microphone = Microphone()
 with microphone as source:
     recognizer.adjust_for_ambient_noise(source)
 
+# Background callback
+
+def audio_callback(recognizer, audio):
+    try:
+        prompt = recognizer.recognize_whisper(audio, model="base", language="english")
+        assistant.answer(prompt, desktop_screenshot.read(encode=True))
+    except UnknownValueError:
+        print("There was an error processing the audio.")
+
 stop_listening = recognizer.listen_in_background(microphone, audio_callback)
 
-while True:
-    cv2.imshow("webcam", webcam_stream.read())
-    if cv2.waitKey(1) in [27, ord("q")]:
-        break
-
-webcam_stream.stop()
-cv2.destroyAllWindows()
-stop_listening(wait_for_stop=False)
+# Main loop
+try:
+    while True:
+        screenshot = desktop_screenshot.read()
+        if screenshot is not None:
+            cv2.imshow("Desktop", screenshot)
+        if cv2.waitKey(1) in [27, ord("q")]:
+            break
+except KeyboardInterrupt:
+    pass
+finally:
+    desktop_screenshot.stop()
+    cv2.destroyAllWindows()
+    stop_listening(wait_for_stop=False)
+    
